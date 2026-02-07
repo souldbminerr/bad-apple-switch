@@ -3,76 +3,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <malloc.h>
 // use ffmpeg to convert to wav
-// ex: ffmpeg -i BA.wav -ac 2 -ar 44100 -sample_fmt s16 BA_conv.wav
+// ex: ffmpeg -i BA.wav -ac 2 -ar 48000 -sample_fmt s16 BA_out.wav
+
 static inline double getTimeSeconds()
 {
     return armGetSystemTick() / (double)armGetSystemTickFreq();
 }
+
 constexpr double FPS = 30.0;
 constexpr size_t WAV_HEADER_SIZE = 44;
+constexpr size_t AUDIO_CHUNK_SIZE = 0x10000; // 64 KB per buffer
+constexpr int AUDIO_BUFFER_COUNT = 4;         // 4 buffers
 
-struct WavData {
-    u8* data;
-    size_t size;
+struct AudioRingBuffer {
+    u8* data[AUDIO_BUFFER_COUNT];
+    AudioOutBuffer buffers[AUDIO_BUFFER_COUNT];
+    int count;
+    int next; // next buffer to fill
 };
-
-bool loadWav(const char* path, WavData& out)
-{
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-
-    fseek(f, 0, SEEK_END);
-    size_t fileSize = ftell(f);
-    rewind(f);
-
-    if (fileSize <= WAV_HEADER_SIZE) {
-        fclose(f);
-        return false;
-    }
-
-    fseek(f, WAV_HEADER_SIZE, SEEK_SET);
-
-    out.size = fileSize - WAV_HEADER_SIZE;
-    out.data = (u8*)memalign(0x1000, out.size);
-
-    fread(out.data, 1, out.size, f);
-    fclose(f);
-
-    return true;
-}
-
-void playMusic()
-{
-    audoutInitialize();
-    audoutStartAudioOut();
-
-    WavData wav{};
-    if (!loadWav("romfs:/res/BA.wav", wav))
-        return;
-
-    AudioOutBuffer buffer{};
-    buffer.next = nullptr;
-    buffer.buffer = wav.data;
-    buffer.buffer_size = wav.size;
-    buffer.data_size = wav.size;
-
-    while (appletMainLoop())
-    {
-        audoutAppendAudioOutBuffer(&buffer);
-
-        AudioOutBuffer* released = nullptr;
-        u32 released_count = 0;
-        audoutWaitPlayFinish(&released, &released_count, UINT64_MAX);
-    }
-
-    audoutStopAudioOut();
-    audoutExit();
-
-    free(wav.data);
-}
 
 void printFrame(int frame)
 {
@@ -89,6 +39,47 @@ void printFrame(int frame)
     fclose(f);
 }
 
+bool initAudioRingBuffer(AudioRingBuffer& ring)
+{
+    ring.count = AUDIO_BUFFER_COUNT;
+    ring.next = 0;
+
+    for (int i = 0; i < ring.count; i++) {
+        ring.data[i] = (u8*)memalign(0x1000, AUDIO_CHUNK_SIZE);
+        if (!ring.data[i])
+            return false;
+
+        ring.buffers[i].next = nullptr;
+        ring.buffers[i].buffer = ring.data[i];
+        ring.buffers[i].buffer_size = 0;
+        ring.buffers[i].data_size = 0;
+    }
+    return true;
+}
+
+void freeAudioRingBuffer(AudioRingBuffer& ring)
+{
+    for (int i = 0; i < ring.count; i++) {
+        free(ring.data[i]);
+    }
+}
+
+bool fillAudioBuffer(AudioRingBuffer& ring, FILE* wavFile)
+{
+    AudioOutBuffer* buf = &ring.buffers[ring.next];
+    size_t read = fread(buf->buffer, 1, AUDIO_CHUNK_SIZE, wavFile);
+    if (read == 0)
+        return false; // EOF
+
+    buf->buffer_size = read;
+    buf->data_size = read;
+
+    audoutAppendAudioOutBuffer(buf);
+
+    ring.next = (ring.next + 1) % ring.count;
+    return true;
+}
+
 int main(int argc, char* argv[])
 {
     consoleInit(NULL);
@@ -98,33 +89,67 @@ int main(int argc, char* argv[])
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
 
-    std::thread musicThread(playMusic);
+    FILE* wavFile = fopen("romfs:/res/BA.wav", "rb");
+    if (!wavFile) {
+        printf("Failed to open WAV\n");
+        romfsExit();
+        consoleExit(NULL);
+        return 1;
+    }
 
-	svcSleepThread(500'000'000);
+    fseek(wavFile, WAV_HEADER_SIZE, SEEK_SET);
 
-	double startTime = getTimeSeconds();
-	int lastFrame = -1;
+    audoutInitialize();
+    audoutStartAudioOut();
 
-	while (appletMainLoop())
-	{
-		double now = getTimeSeconds();
-		int frame = (int)((now - startTime) * FPS);
+    AudioRingBuffer ring;
+    if (!initAudioRingBuffer(ring)) {
+        printf("Failed to allocate audio buffers\n");
+        fclose(wavFile);
+        romfsExit();
+        consoleExit(NULL);
+        return 1;
+    }
 
-		if (frame >= 6560)
-			break;
+    AudioOutBuffer* released = nullptr;
+    u32 released_count = 0;
 
-		if (frame != lastFrame)
-		{
-			consoleClear();
-			printFrame(frame);
-			consoleUpdate(NULL);
-			lastFrame = frame;
-		}
+    for (int i = 0; i < AUDIO_BUFFER_COUNT; i++)
+        fillAudioBuffer(ring, wavFile);
 
-		svcSleepThread(1'000'000);
-	}
+    double startTime = getTimeSeconds();
+    int lastFrame = -1;
 
-    musicThread.join();
+    while (appletMainLoop())
+    {
+        double now = getTimeSeconds();
+        int frame = (int)((now - startTime) * FPS);
+        if (frame >= 6560)
+            break;
+
+        if (frame != lastFrame)
+        {
+            consoleClear();
+            printFrame(frame);
+            consoleUpdate(NULL);
+            lastFrame = frame;
+        }
+
+        audoutWaitPlayFinish(&released, &released_count, 0);
+        for (u32 i = 0; i < released_count; i++)
+            fillAudioBuffer(ring, wavFile); // refill released buffers
+
+        svcSleepThread(1'000'000); // 1 ms
+    }
+
+    // Wait for remaining audio to finish
+    audoutWaitPlayFinish(&released, &released_count, UINT64_MAX);
+
+    // Cleanup
+    freeAudioRingBuffer(ring);
+    audoutStopAudioOut();
+    audoutExit();
+    fclose(wavFile);
 
     romfsExit();
     consoleExit(NULL);
